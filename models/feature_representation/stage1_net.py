@@ -11,7 +11,7 @@ class Stage1LHMRM(nn.Module):
         self.cnn_ir = ShallowCNNExtractor(in_channels=1)
         
         self.dual_mamba = DualMambaEncoder(depth=4, dim=128)
-        self.cem = ComplementarityEstimationModule(in_channels=128,use_multiplication=use_multiplication_in_cem)
+        self.cem = ComplementarityEstimationModule(in_channels=128, use_multiplication=use_multiplication_in_cem)
         
         self.alpha = nn.Parameter(torch.tensor(1.0))
         self.fusion_conv = nn.Sequential(

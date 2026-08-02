@@ -11,8 +11,6 @@ class VisionMambaBlock(nn.Module):
         
         self.in_proj = nn.Linear(dim, self.d_inner * 2)
         
-        # FIX: Explicit symmetric padding calculation for Conv1d
-        # For d_conv=4, padding_left=1, padding_right=2 maintains sequence length 4096
         self.d_conv = d_conv
         self.pad_left = (d_conv - 1) // 2
         self.pad_right = d_conv - 1 - self.pad_left
@@ -22,7 +20,7 @@ class VisionMambaBlock(nn.Module):
             out_channels=self.d_inner,
             kernel_size=d_conv, 
             stride=1,
-            padding=0, # Handled manually via F.pad
+            padding=0,
             groups=self.d_inner
         )
         
@@ -33,26 +31,21 @@ class VisionMambaBlock(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.shape
-        x_flat = x.flatten(2).transpose(1, 2) # [B, 4096, 128]
+        x_flat = x.flatten(2).transpose(1, 2)
         residual = x_flat
         x_norm = self.norm(x_flat)
         
-        # Linear Expansion & Split
         xz = self.in_proj(x_norm)
-        x_proj, z = xz.chunk(2, dim=-1) # Each [B, 4096, 256]
+        x_proj, z = xz.chunk(2, dim=-1)
         
-        # 1D Conv over sequence length with asymmetric padding
-        x_conv = x_proj.transpose(1, 2) # [B, 256, 4096]
-        x_conv = F.pad(x_conv, (self.pad_left, self.pad_right)) # Pad sequence dim
-        x_conv = F.silu(self.conv1d(x_conv)).transpose(1, 2) # Back to [B, 4096, 256]
+        x_conv = x_proj.transpose(1, 2)
+        x_conv = F.pad(x_conv, (self.pad_left, self.pad_right))
+        x_conv = F.silu(self.conv1d(x_conv)).transpose(1, 2)
         
-        # Selective Gating
         dt_x = self.x_proj(x_conv)
         dt = F.softplus(self.dt_proj(dt_x[:, :, :16]))
         
-        # Tensor shapes now match: [B, 4096, 256] * [B, 4096, 256] * [B, 4096, 256]
         y = x_conv * torch.sigmoid(dt) * F.silu(z)
-        
         out = self.dropout(self.out_proj(y)) + residual
         return out.transpose(1, 2).view(B, C, H, W)
 

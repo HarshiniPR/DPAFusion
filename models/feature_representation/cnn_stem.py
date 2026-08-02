@@ -7,9 +7,9 @@ class ShallowCNNExtractor(nn.Module):
         self.stem = nn.Sequential(
             nn.Conv2d(in_channels, 32, kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(0.1, inplace=True),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),  # -> 64x128x128
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
             nn.LeakyReLU(0.1, inplace=True),
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1), # -> 128x64x64
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
             nn.LeakyReLU(0.1, inplace=True)
         )
 

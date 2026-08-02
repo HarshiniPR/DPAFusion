@@ -2,8 +2,8 @@ import os
 import torch
 from torch.utils.data import DataLoader
 from datasets.dataset import LLVIPDataset
-from stage1.models.stage1_net import Stage1LHMRM
-from stage1.losses import Stage1Loss
+from models.feature_representation.stage1_net import Stage1LHMRM
+from losses.stage1_loss import Stage1Loss
 
 def train():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

@@ -9,7 +9,6 @@ class LLVIPDataset(Dataset):
         super().__init__()
         
         if root_dir is None:
-            # Resolves path to DAPFUSION/LLVIP/ relative to this file's location
             base_project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             root_dir = os.path.join(base_project_dir, 'LLVIP')
             
@@ -22,7 +21,6 @@ class LLVIPDataset(Dataset):
                 f"LLVIP directories not found.\n"
                 f"Expected RGB at: {self.vis_dir}\n"
                 f"Expected IR at:  {self.ir_dir}\n"
-                f"Please verify your folder structure."
             )
 
         self.filenames = sorted([
