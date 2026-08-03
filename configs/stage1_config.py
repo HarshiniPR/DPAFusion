@@ -12,8 +12,8 @@ class Stage1Config:
         # Training Parameters (Preserved)
         self.img_size = (256, 256)
         self.batch_size = 8
-        self.epochs = 5
-        self.lr = 1e-4
+        self.epochs = 10
+        self.lr = 5e-5
         self.weight_decay = 1e-4
         self.num_workers = 2
         
