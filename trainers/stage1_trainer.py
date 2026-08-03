@@ -24,6 +24,9 @@ def run_stage1_training(config):
     criterion = Stage1Loss().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
 
+    # Track best loss across epochs
+    best_loss = float('inf')
+
     for epoch in range(1, config.epochs + 1):
         model.train()
         running_loss = 0.0
@@ -54,18 +57,29 @@ def run_stage1_training(config):
                     f"Info: {loss_dict['loss_info']:.4f}"
                 )
 
+        num_batches = len(train_loader)
+        avg_epoch_loss = running_loss / num_batches
+
+        # 1. Save standard epoch checkpoint
         ckpt_path = os.path.join(config.checkpoint_dir, f'stage1_epoch_{epoch}.pth')
-        torch.save({
+        checkpoint_data = {
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'loss': running_loss / len(train_loader)
-        }, ckpt_path)
+            'loss': avg_epoch_loss
+        }
+        torch.save(checkpoint_data, ckpt_path)
 
-        num_batches = len(train_loader)
+        # 2. Check and save the BEST checkpoint
+        if avg_epoch_loss < best_loss:
+            best_loss = avg_epoch_loss
+            best_ckpt_path = os.path.join(config.checkpoint_dir, 'stage1_best.pth')
+            torch.save(checkpoint_data, best_ckpt_path)
+            print(f"--> [NEW BEST] Saved best model to {best_ckpt_path} (Loss: {best_loss:.4f})")
+
         print("\n" + "="*65)
         print(f"EPOCH {epoch} SUMMARY & LOSS BREAKDOWN:")
-        print(f" -> Average Total Loss     : {running_loss / num_batches:.4f}")
+        print(f" -> Average Total Loss     : {avg_epoch_loss:.4f}")
         print(f" -> Avg Loss Decorrelation : {running_metrics['loss_decorr'] / num_batches:.4f}")
         print(f" -> Avg Loss CEM Entropy   : {running_metrics['loss_comp'] / num_batches:.4f}")
         print(f" -> Avg Loss Structure     : {running_metrics['loss_structure'] / num_batches:.4f}")
