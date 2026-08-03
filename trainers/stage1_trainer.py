@@ -84,5 +84,7 @@ def run_stage1_training(config):
         print(f" -> Avg Loss CEM Entropy   : {running_metrics['loss_comp'] / num_batches:.4f}")
         print(f" -> Avg Loss Structure     : {running_metrics['loss_structure'] / num_batches:.4f}")
         print(f" -> Avg Loss Info          : {running_metrics['loss_info'] / num_batches:.4f}")
+        # Check actual CEM values inside the tensor
+        print(f" -> Sc Channel Activation Stats | Mean: {Sc.mean().item():.4f} | Min: {Sc.min().item():.4f} | Max: {Sc.max().item():.4f} | Std: {Sc.std().item():.4f}")
         print(f" -> Checkpoint Saved       : {ckpt_path}")
         print("="*65 + "\n")
