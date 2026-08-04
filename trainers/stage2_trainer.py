@@ -9,6 +9,7 @@ from models.rl_policy.ppo_actor_critic import FullActorCritic
 from losses.stage2_reward import FullMultiObjectiveReward
 
 def upsample_zw_to_grid(z_w, height=64, width=64):
+    """ Deterministic expansion of latent z_w (B, 12) to spatial grid (B, 1, 64, 64) """
     B = z_w.shape[0]
     grid_raw = z_w.view(B, 1, 3, 4)
     return F.interpolate(grid_raw, size=(height, width), mode='bilinear', align_corners=False)
@@ -19,9 +20,11 @@ def run_stage2_training(config):
 
     print(f"=== Training Stage 2 (Full Hybrid PPO Policy - Groups A, B, C) on {device} ===")
 
+    # 1. Dataset
     train_dataset = LLVIPDataset(root_dir=config.data_dir, split='train', img_size=config.img_size)
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=config.num_workers)
 
+    # 2. Load Frozen Stage 1 Backbone
     stage1_model = Stage1LHMRM(use_multiplication_in_cem=config.use_cem_multiplication).to(device)
     if os.path.exists(config.stage1_ckpt_path):
         ckpt = torch.load(config.stage1_ckpt_path, map_location=device)
@@ -34,9 +37,12 @@ def run_stage2_training(config):
     for p in stage1_model.parameters():
         p.requires_grad = False
 
+    # 3. Policy Agent & Reward Engine
     agent = FullActorCritic(state_dim=322, hidden_dim=128).to(device)
     reward_fn = FullMultiObjectiveReward().to(device)
     optimizer = torch.optim.AdamW(agent.parameters(), lr=config.lr_actor, weight_decay=1e-4)
+
+    best_reward = -float('inf')
 
     for epoch in range(1, config.epochs + 1):
         agent.train()
@@ -49,13 +55,14 @@ def run_stage2_training(config):
             with torch.no_grad():
                 Fu, Fr, Ft, Sc = stage1_model(Ir, It)
 
-            # Sample Action (detach to prevent graph issues across step rollouts)
+            # Sample Action (Group A, B, C)
             actions, log_prob_old, _, values = agent.get_action(Fu, Sc, Ir, It, deterministic=False)
 
             c_rgb = actions['c_rgb'].unsqueeze(-1).unsqueeze(-1)
             c_th = actions['c_th'].unsqueeze(-1).unsqueeze(-1)
             c_comp = actions['c_comp'].unsqueeze(-1).unsqueeze(-1)
             
+            # Compute Spatial Region Weights (Group B)
             bias = torch.logit(c_rgb.clamp(1e-4, 1-1e-4)) - torch.logit(c_th.clamp(1e-4, 1-1e-4))
             W_rgb = torch.sigmoid(bias + upsample_zw_to_grid(actions['z_w']))
             W_th = 1.0 - W_rgb
@@ -86,7 +93,7 @@ def run_stage2_training(config):
                 optimizer.step()
 
             running_reward += rewards.mean().item()
-            
+
             if (step + 1) % 20 == 0 or (step + 1) == len(train_loader):
                 top_op = torch.argmax(actions['alpha_op'], dim=-1).mode().item()
                 print(
@@ -122,5 +129,3 @@ def run_stage2_training(config):
             best_ckpt_path = os.path.join(config.checkpoint_dir, 'stage2_best.pth')
             torch.save(checkpoint_data, best_ckpt_path)
             print(f"--> [NEW BEST] Saved best Stage 2 RL policy to {best_ckpt_path} (Reward: {best_reward:.4f})\n")
-            
-           
