@@ -17,10 +17,13 @@ class Stage2Config:
         if not os.path.exists(self.stage1_ckpt_path):
             self.stage1_ckpt_path = os.path.join(self.local_ckpt_dir, 'stage1_best.pth')
 
+        # Model Flag for Stage 1 Backbone
+        self.use_cem_multiplication = False   # <-- ADDED THIS LINE
+
         # Training Parameters
         self.img_size = (256, 256)
         self.batch_size = 8
-        self.epochs = 10
+        self.epochs = 5
         self.lr_actor = 1e-4
         self.lr_critic = 3e-4
         self.gamma = 0.99
