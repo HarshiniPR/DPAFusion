@@ -19,14 +19,13 @@ class StateEncoder(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.ReLU(inplace=True)
         )
-
     def compute_scene_descriptors(self, Ir, It):
+        B = Ir.shape[0]
         # RGB Illumination (Mean intensity)
-        illum_rgb = torch.mean(Ir, dim=[-3, -2, -1], keepdim=True)
+        illum_rgb = torch.mean(Ir, dim=[-3, -2, -1], keepdim=True).view(B, 1)
         # Thermal Contrast (Standard deviation)
-        contrast_th = torch.std(It, dim=[-3, -2, -1], keepdim=True)
-        return torch.cat([illum_rgb, contrast_th], dim=-1)
-
+        contrast_th = torch.std(It, dim=[-3, -2, -1], keepdim=True).view(B, 1)
+        return torch.cat([illum_rgb, contrast_th], dim=-1) # (B, 2)
     def forward(self, Fu, Sc, Ir, It):
         B = Fu.shape[0]
         
@@ -34,18 +33,18 @@ class StateEncoder(nn.Module):
         Fu_det = Fu.detach()
         Sc_det = Sc.detach()
         
-        gap_feat = self.gap(Fu_det).view(B, -1)                      # 128
-        gmp_feat = self.gmp(Fu_det).view(B, -1)                      # 128
+        gap_feat = self.gap(Fu_det).view(B, -1)                      # (B, 128)
+        gmp_feat = self.gmp(Fu_det).view(B, -1)                      # (B, 128)
         
         # Sc is (B, 128), reshape to (B, 1, 8, 16) or pool across channels for 8x8 grid
         Sc_grid = Sc_det.view(B, 1, 8, 16)
-        cem_pooled = self.cem_pool(Sc_grid).view(B, -1)              # 64
+        cem_pooled = self.cem_pool(Sc_grid).view(B, -1)              # (B, 64)
         
-        phi_scene = self.compute_scene_descriptors(Ir, It)           # 2
+        phi_scene = self.compute_scene_descriptors(Ir, It)           # (B, 2)
         
-        s_t = torch.cat([gap_feat, gmp_feat, cem_pooled, phi_scene], dim=-1) # 322
+        # All tensors are now 2D: (B, 128 + 128 + 64 + 2) -> (B, 322)
+        s_t = torch.cat([gap_feat, gmp_feat, cem_pooled, phi_scene], dim=-1) 
         return self.fc(s_t)
-
 
 class FullActorCritic(nn.Module):
     """
