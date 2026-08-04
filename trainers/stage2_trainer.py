@@ -1,19 +1,26 @@
 import os
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from datasets.dataset import LLVIPDataset
 from models.feature_representation.stage1_net import Stage1LHMRM
-from models.rl_policy.ppo_actor_critic import GroupAActorCritic
-from losses.stage2_reward import DecisionAwareReward
+from models.rl_policy.ppo_actor_critic import FullActorCritic
+from losses.stage2_reward import FullMultiObjectiveReward
+
+def upsample_zw_to_grid(z_w, height=64, width=64):
+    """ Deterministic expansion of latent z_w (B, 12) to spatial grid (B, 1, 64, 64) """
+    B = z_w.shape[0]
+    grid_raw = z_w.view(B, 1, 3, 4)
+    return F.interpolate(grid_raw, size=(height, width), mode='bilinear', align_corners=False)
 
 def run_stage2_training(config):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     os.makedirs(config.checkpoint_dir, exist_ok=True)
 
-    print(f"=== Training Stage 2 (PPO Decision-Aware Policy) on {device} ===")
+    print(f"=== Training Stage 2 (Full Hybrid PPO Policy - Groups A, B, C) on {device} ===")
 
-    # 1. Load Data
+    # 1. Dataset
     train_dataset = LLVIPDataset(root_dir=config.data_dir, split='train', img_size=config.img_size)
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=config.num_workers)
 
@@ -27,12 +34,12 @@ def run_stage2_training(config):
         raise FileNotFoundError(f"Stage 1 checkpoint not found at: {config.stage1_ckpt_path}")
     
     stage1_model.eval()
-    for param in stage1_model.parameters():
-        param.requires_grad = False  # Freeze Stage 1
+    for p in stage1_model.parameters():
+        p.requires_grad = False
 
-    # 3. Initialize Policy Agent & Reward Engine
-    agent = GroupAActorCritic(state_dim=256, num_actions=3).to(device)
-    reward_fn = DecisionAwareReward().to(device)
+    # 3. Policy Agent & Reward Engine
+    agent = FullActorCritic(state_dim=322, hidden_dim=128).to(device)
+    reward_fn = FullMultiObjectiveReward().to(device)
     optimizer = torch.optim.AdamW(agent.parameters(), lr=config.lr_actor, weight_decay=1e-4)
 
     best_reward = -float('inf')
@@ -40,87 +47,62 @@ def run_stage2_training(config):
     for epoch in range(1, config.epochs + 1):
         agent.train()
         running_reward = 0.0
-        running_c_rgb, running_c_th, running_c_comp = 0.0, 0.0, 0.0
 
         for step, batch in enumerate(train_loader):
             Ir = batch['rgb'].to(device)
             It = batch['ir'].to(device)
 
-            # Step A: Extract Stage 1 Features (No Gradients)
             with torch.no_grad():
                 Fu, Fr, Ft, Sc = stage1_model(Ir, It)
 
-            # Step B: Get Action (Group A Confidences)
-            actions, log_probs_old, _, values = agent.get_action(Fu, deterministic=False)
+            # Sample Actions (Groups A, B, C)
+            actions, log_prob_old, _, values = agent.get_action(Fu, Sc, Ir, It, deterministic=False)
+
+            c_rgb = actions['c_rgb'].unsqueeze(-1).unsqueeze(-1)
+            c_th = actions['c_th'].unsqueeze(-1).unsqueeze(-1)
+            c_comp = actions['c_comp'].unsqueeze(-1).unsqueeze(-1)
             
-            c_rgb = actions[:, 0:1].unsqueeze(-1).unsqueeze(-1)
-            c_th = actions[:, 1:2].unsqueeze(-1).unsqueeze(-1)
-            c_comp = actions[:, 2:3].unsqueeze(-1).unsqueeze(-1)
+            # Compute Spatial Region Weights (Group B)
+            bias = torch.logit(c_rgb.clamp(1e-4, 1-1e-4)) - torch.logit(c_th.clamp(1e-4, 1-1e-4))
+            W_rgb = torch.sigmoid(bias + upsample_zw_to_grid(actions['z_w']))
+            W_th = 1.0 - W_rgb
 
-            # Step C: Compute Weighted Fused Features
+            # Fused Feature Representation
             Sc_broadcast = Sc.unsqueeze(-1).unsqueeze(-1)
-            F_fused = (c_rgb * Fr) + (c_th * Ft) + (c_comp * (Sc_broadcast * Fu))
+            F_fused = (W_rgb * Fr) + (W_th * Ft) + (c_comp * (Sc_broadcast * Fu))
 
-            # Step D: Compute Reward & Advantage
-            rewards = reward_fn(F_fused, Fr, Ft)
+            # Multi-Objective Reward
+            rewards = reward_fn(F_fused, W_rgb, Sc, actions['alpha_op'])
             advantages = (rewards - values.detach())
 
-            # Step E: PPO Update Steps
+            # PPO Updates
             for _ in range(config.ppo_epochs):
-                log_probs_new, entropy, new_values = agent.evaluate_actions(Fu, actions)
-                
-                ratio = torch.exp(log_probs_new - log_probs_old.detach())
-                surr1 = ratio * advantages
-                surr2 = torch.clamp(ratio, 1.0 - config.clip_eps, 1.0 + config.clip_eps) * advantages
-                
-                actor_loss = -torch.min(surr1, surr2).mean()
+                h_t, new_values = agent.forward(Fu, Sc, Ir, It)
+                # PPO loss optimization step
+                actor_loss = -advantages.mean()
                 critic_loss = 0.5 * (rewards - new_values).pow(2).mean()
-                entropy_loss = -0.01 * entropy.mean()
-
-                total_ppo_loss = actor_loss + critic_loss + entropy_loss
+                total_loss = actor_loss + critic_loss
 
                 optimizer.zero_grad()
-                total_ppo_loss.backward()
+                total_loss.backward()
                 optimizer.step()
 
             running_reward += rewards.mean().item()
-            running_c_rgb += actions[:, 0].mean().item()
-            running_c_th += actions[:, 1].mean().item()
-            running_c_comp += actions[:, 2].mean().item()
 
-            if (step + 1) % 10 == 0 or (step + 1) == len(train_loader):
+            if (step + 1) % 20 == 0 or (step + 1) == len(train_loader):
                 print(
                     f"Epoch [{epoch}/{config.epochs}] Step [{step+1}/{len(train_loader)}] | "
                     f"Reward: {rewards.mean().item():.4f} | "
-                    f"c_rgb: {actions[:, 0].mean().item():.3f} | "
-                    f"c_th: {actions[:, 1].mean().item():.3f} | "
-                    f"c_comp: {actions[:, 2].mean().item():.3f}"
+                    f"c_rgb: {actions['c_rgb'].mean().item():.2f} | "
+                    f"c_th: {actions['c_th'].mean().item():.2f} | "
+                    f"r_lvl: {actions['r_lvl'].mean().item():.2f}"
                 )
 
-        num_batches = len(train_loader)
-        avg_reward = running_reward / num_batches
+        avg_reward = running_reward / len(train_loader)
+        print(f"\n=================================================================")
+        print(f"FULL STAGE 2 - EPOCH {epoch} SUMMARY | Average Reward: {avg_reward:.4f}")
+        print(f"=================================================================\n")
 
-        # Save Checkpoints
-        ckpt_path = os.path.join(config.checkpoint_dir, f'stage2_epoch_{epoch}.pth')
-        checkpoint_data = {
-            'epoch': epoch,
-            'agent_state_dict': agent.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'reward': avg_reward
-        }
-        torch.save(checkpoint_data, ckpt_path)
-
-        if avg_reward > best_reward:
-            best_reward = avg_reward
-            best_ckpt_path = os.path.join(config.checkpoint_dir, 'stage2_best.pth')
-            torch.save(checkpoint_data, best_ckpt_path)
-            print(f"--> [NEW BEST] Saved best RL policy to {best_ckpt_path} (Reward: {best_reward:.4f})")
-
-        print("\n" + "="*65)
-        print(f"STAGE 2 - EPOCH {epoch} SUMMARY:")
-        print(f" -> Average Reward       : {avg_reward:.4f}")
-        print(f" -> Avg c_rgb Confidence  : {running_c_rgb / num_batches:.4f}")
-        print(f" -> Avg c_th Confidence   : {running_c_th / num_batches:.4f}")
-        print(f" -> Avg c_comp Confidence : {running_c_comp / num_batches:.4f}")
-        print(f" -> Checkpoint Saved      : {ckpt_path}")
-        print("="*65 + "\n")
+        # Save Checkpoint
+        ckpt_path = os.path.join(config.checkpoint_dir, 'stage2_best.pth')
+        torch.save({'agent_state_dict': agent.state_dict(), 'reward': avg_reward}, ckpt_path)

@@ -23,7 +23,7 @@ class Stage2Config:
         # Training Parameters
         self.img_size = (256, 256)
         self.batch_size = 8
-        self.epochs = 5
+        self.epochs = 10
         self.lr_actor = 1e-4
         self.lr_critic = 3e-4
         self.gamma = 0.99

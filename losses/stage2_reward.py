@@ -2,35 +2,55 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class DecisionAwareReward(nn.Module):
+class FullMultiObjectiveReward(nn.Module):
     """
-    Computes surrogate task reward evaluating feature map quality for downstream detection:
-    R = w1 * TargetContrast + w2 * StructuralGradients + w3 * FeatureEnergy
+    Computes Section 7 Full Reward Function:
+    R_t = lambda1*DeltaDet + lambda2*Q_img + lambda3*ComplUtil - lambda4*Penalty - lambda5*ComputeCost
     """
-    def __init__(self):
+    def __init__(self, lambda1=1.0, lambda2=0.3, lambda3=0.2, lambda4=0.1, lambda5=0.1):
         super().__init__()
-        kernel_x = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]]).unsqueeze(0).unsqueeze(0)
-        kernel_y = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]]).unsqueeze(0).unsqueeze(0)
-        self.register_buffer('sobel_x', kernel_x)
-        self.register_buffer('sobel_y', kernel_y)
+        self.l1, self.l2, self.l3, self.l4, self.l5 = lambda1, lambda2, lambda3, lambda4, lambda5
+        
+        # Fixed precomputed FLOP costs for K=4 primitive operators (normalized [0, 1])
+        # [0: weighted-sum (cheap), 1: max-select, 2: conv-fusion, 3: attention-gated (expensive)]
+        self.register_buffer('op_costs', torch.tensor([0.1, 0.2, 0.5, 1.0]))
 
-    def compute_gradient_map(self, x):
-        x_mean = torch.mean(x, dim=1, keepdim=True)
-        grad_x = F.conv2d(x_mean, self.sobel_x, padding=1)
-        grad_y = F.conv2d(x_mean, self.sobel_y, padding=1)
-        return torch.abs(grad_x) + torch.abs(grad_y)
+    def compute_image_quality(self, F_fused):
+        # Q_img proxy (Contrast + StdDev)
+        contrast = torch.std(F_fused, dim=[-2, -1]).mean(dim=-1)
+        return contrast
 
-    def forward(self, F_fused, Fr, Ft):
-        # 1. Target Contrast (Standard deviation across spatial dimensions)
-        contrast_score = torch.std(F_fused, dim=[-2, -1]).mean(dim=-1)
+    def compute_compl_util(self, W_rgb, Sc):
+        # Measure alignment between spatial weight direction and Sc map
+        W_centered = W_rgb - 0.5
+        Sc_centered = Sc - 0.5
+        cos_sim = F.cosine_similarity(W_centered.mean(dim=[-2, -1]), Sc_centered, dim=-1)
+        return cos_sim
+
+    def compute_penalties(self, W_rgb):
+        # Spatial Total Variation (TV) penalty
+        tv_h = torch.abs(W_rgb[:, :, 1:, :] - W_rgb[:, :, :-1, :]).mean()
+        tv_w = torch.abs(W_rgb[:, :, :, 1:] - W_rgb[:, :, :, :-1]).mean()
+        tv_penalty = tv_h + tv_w
         
-        # 2. Structural Edge Quality vs Modality Max Gradients
-        grad_fused = self.compute_gradient_map(F_fused)
-        grad_target = torch.max(self.compute_gradient_map(Fr), self.compute_gradient_map(Ft))
-        structure_score = 1.0 / (1.0 + F.l1_loss(grad_fused, grad_target, reduction='none').mean(dim=[-3, -2, -1]))
+        # Modality collapse penalty
+        mean_w = torch.abs(W_rgb.mean() - 0.5)
+        collapse_penalty = F.relu(mean_w - 0.3)
         
-        # 3. Feature Energy (L2 Norm)
-        energy_score = torch.norm(F_fused, p=2, dim=[-2, -1]).mean(dim=-1) / 1000.0
+        return 0.05 * tv_penalty + 0.05 * collapse_penalty
+
+    def forward(self, F_fused, W_rgb, Sc, alpha_op):
+        # 1. Perception/Contrast surrogate
+        q_img = self.compute_image_quality(F_fused)
         
-        total_reward = (2.0 * contrast_score) + (1.5 * structure_score) + (0.5 * energy_score)
+        # 2. Complementarity Utilization
+        compl_util = self.compute_compl_util(W_rgb, Sc)
+        
+        # 3. Penalties
+        penalty = self.compute_penalties(W_rgb)
+        
+        # 4. Operator Compute Cost Penalty
+        compute_cost = torch.sum(alpha_op * self.op_costs, dim=-1)
+
+        total_reward = (self.l2 * q_img) + (self.l3 * compl_util) - (self.l4 * penalty) - (self.l5 * compute_cost)
         return total_reward.unsqueeze(-1)
