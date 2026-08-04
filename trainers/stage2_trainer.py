@@ -95,7 +95,7 @@ def run_stage2_training(config):
             running_reward += rewards.mean().item()
 
             if (step + 1) % 20 == 0 or (step + 1) == len(train_loader):
-                top_op = torch.argmax(actions['alpha_op'], dim=-1).mode().item()
+                top_op = torch.argmax(actions['alpha_op'], dim=-1).mode().values.item()
                 print(
                     f"Epoch [{epoch}/{config.epochs}] Step [{step+1}/{len(train_loader)}] | "
                     f"Reward: {rewards.mean().item():.4f} | "
