@@ -1,1 +1,1 @@
-from .ppo_actor_critic import GroupAActorCritic
+from .ppo_actor_critic import FullActorCritic
