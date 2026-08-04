@@ -86,14 +86,19 @@ def run_stage2_training(config):
                 optimizer.step()
 
             running_reward += rewards.mean().item()
-
+            
             if (step + 1) % 20 == 0 or (step + 1) == len(train_loader):
+                top_op = torch.argmax(actions['alpha_op'], dim=-1).mode().item()
                 print(
                     f"Epoch [{epoch}/{config.epochs}] Step [{step+1}/{len(train_loader)}] | "
                     f"Reward: {rewards.mean().item():.4f} | "
                     f"c_rgb: {actions['c_rgb'].mean().item():.2f} | "
                     f"c_th: {actions['c_th'].mean().item():.2f} | "
-                    f"r_lvl: {actions['r_lvl'].mean().item():.2f}"
+                    f"c_comp: {actions['c_comp'].mean().item():.2f} | "
+                    f"g_int: {actions['g_int'].mean().item():.2f} | "
+                    f"r_lvl: {actions['r_lvl'].mean().item():.2f} | "
+                    f"d_pres: {actions['d_pres'].mean().item():.2f} | "
+                    f"Op: {top_op}"
                 )
 
         avg_reward = running_reward / len(train_loader)
@@ -101,5 +106,21 @@ def run_stage2_training(config):
         print(f"FULL STAGE 2 - EPOCH {epoch} SUMMARY | Average Reward: {avg_reward:.4f}")
         print(f"=================================================================\n")
 
+        # Save Epoch Checkpoint
         ckpt_path = os.path.join(config.checkpoint_dir, f'stage2_epoch_{epoch}.pth')
-        torch.save({'agent_state_dict': agent.state_dict(), 'reward': avg_reward}, ckpt_path)
+        checkpoint_data = {
+            'epoch': epoch,
+            'agent_state_dict': agent.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'reward': avg_reward
+        }
+        torch.save(checkpoint_data, ckpt_path)
+
+        # Save Best Checkpoint
+        if avg_reward > best_reward:
+            best_reward = avg_reward
+            best_ckpt_path = os.path.join(config.checkpoint_dir, 'stage2_best.pth')
+            torch.save(checkpoint_data, best_ckpt_path)
+            print(f"--> [NEW BEST] Saved best Stage 2 RL policy to {best_ckpt_path} (Reward: {best_reward:.4f})\n")
+            
+           
