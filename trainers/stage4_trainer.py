@@ -58,8 +58,8 @@ def run_stage4_training(config):
 
     # 6. Optimizers & Losses
     opt_G = torch.optim.Adam(net_G.parameters(), lr=1e-4, betas=(0.5, 0.999))
-    opt_D = torch.optim.Adam(net_D.parameters(), lr=1e-4, betas=(0.5, 0.999))
-    loss_suite = Stage4LossSuite().to(device)
+    opt_D = torch.optim.Adam(net_D.parameters(), lr=2e-5, betas=(0.5, 0.999))
+    loss_suite = Stage4LossSuite(lambda_adv=0.05, lambda_grad=20.0, lambda_pixel=5.0).to(device)
 
     best_g_loss = float('inf')
 
@@ -78,46 +78,37 @@ def run_stage4_training(config):
                 Fu, Fr, Ft, Sc = stage1(Ir, It)
                 actions, _, _, _ = stage2.get_action(Fu, Sc, Ir, It, deterministic=True)
                 F_fused, _, _ = stage3(Fr, Ft, Fu, Sc, actions)
+            
+            # (1) Train Dual Discriminator only when not saturated
+            if loss_D_val > 0.15 or step == 0:
+                opt_D.zero_grad()
+                d_real_rgb = net_D.forward_rgb(Ir)
+                d_fake_rgb = net_D.forward_rgb(I_fused.detach())
+                loss_D_rgb = loss_suite.d_loss(d_real_rgb, d_fake_rgb)
 
-            # -----------------------------------------------
-            # (1) Train Dual Discriminator (D_rgb, D_th)
-            # -----------------------------------------------
-            opt_D.zero_grad()
-            with torch.no_grad():
-                I_fused = net_G(F_fused, actions)
+                d_real_th = net_D.forward_th(It_3c)
+                d_fake_th = net_D.forward_th(I_fused.detach())
+                loss_D_th = loss_suite.d_loss(d_real_th, d_fake_th)
 
-            # Evaluate D_rgb
-            d_real_rgb = net_D.forward_rgb(Ir)
-            d_fake_rgb = net_D.forward_rgb(I_fused.detach())
-            loss_D_rgb = loss_suite.d_loss(d_real_rgb, d_fake_rgb)
-
-            # Evaluate D_th
-            d_real_th = net_D.forward_th(It_3c)
-            d_fake_th = net_D.forward_th(I_fused.detach())
-            loss_D_th = loss_suite.d_loss(d_real_th, d_fake_th)
-
-            loss_D = loss_D_rgb + loss_D_th
-            loss_D.backward()
-            opt_D.step()
-
-            # -----------------------------------------------
+                loss_D = loss_D_rgb + loss_D_th
+                loss_D.backward()
+                opt_D.step()
+                loss_D_val = loss_D.item()
+            
             # (2) Train Generator (G)
-            # -----------------------------------------------
             opt_G.zero_grad()
             I_fused = net_G(F_fused, actions)
 
-            # Adversarial Loss
             d_fake_rgb_for_G = net_D.forward_rgb(I_fused)
             d_fake_th_for_G = net_D.forward_th(I_fused)
-            l_adv = loss_suite.g_adversarial_loss(d_fake_rgb_for_G, d_fake_th_for_G)
+            l_adv_scaled, l_adv_raw = loss_suite.g_adversarial_loss(d_fake_rgb_for_G, d_fake_th_for_G)
 
-            # Content Losses (Gradient + Pixel Intensity)
             l_content, l_pixel, l_grad = loss_suite.g_content_loss(I_fused, Ir, It)
 
-            loss_G = l_adv + l_content
+            loss_G = l_adv_scaled + l_content
             loss_G.backward()
             opt_G.step()
-
+            
             running_g_loss += loss_G.item()
 
             if (step + 1) % 20 == 0 or (step + 1) == len(train_loader):
