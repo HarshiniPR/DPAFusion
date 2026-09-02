@@ -6,24 +6,21 @@ class Stage2Config:
         
         # Paths
         self.data_dir = os.path.join(self.project_root, 'LLVIP')
+        # All stage 2 outputs save strictly to root checkpoints first
+        self.checkpoint_dir = os.path.join(self.project_root, 'checkpoints')
         
-        # Direct Google Drive storage for Colab safety
-        self.drive_ckpt_dir = '/content/drive/MyDrive/DPAFusion_Checkpoints/Stage2'
-        self.local_ckpt_dir = os.path.join(self.project_root, 'checkpoints')
-        self.checkpoint_dir = self.drive_ckpt_dir if os.path.exists('/content/drive') else self.local_ckpt_dir
-        
-        # Load Frozen Stage 1 Weights
-        self.stage1_ckpt_path = os.path.join(self.checkpoint_dir, 'stage1_best.pth')
-        if not os.path.exists(self.stage1_ckpt_path):
-            self.stage1_ckpt_path = os.path.join(self.local_ckpt_dir, 'stage1_best.pth')
+        # Frozen Stage 1 Checkpoint resolution: check local first, fallback to Drive
+        local_stage1 = os.path.join(self.checkpoint_dir, 'stage1_best.pth')
+        drive_stage1 = '/content/drive/MyDrive/DPAFusion_Checkpoints/Stage1/stage1_best.pth'
+        self.stage1_ckpt_path = local_stage1 if os.path.exists(local_stage1) else drive_stage1
 
-        # Model Flag for Stage 1 Backbone
-        self.use_cem_multiplication = False   # <-- ADDED THIS LINE
+        # Stage 1 Architecture Match
+        self.use_cem_multiplication = False
 
-        # Training Parameters
+        # PPO Training Parameters
         self.img_size = (256, 256)
         self.batch_size = 8
-        self.epochs = 10
+        self.epochs = 30
         self.lr_actor = 1e-4
         self.lr_critic = 3e-4
         self.gamma = 0.99
