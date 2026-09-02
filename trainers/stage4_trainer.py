@@ -30,14 +30,23 @@ def run_stage4_training(config):
 
     # 3. Load Frozen Stage 2 Policy
     stage2 = FullActorCritic(state_dim=322, hidden_dim=128).to(device)
-    stage2_ckpt_path = os.path.join(os.path.dirname(config.stage1_ckpt_path), 'Stage2', 'stage2_best.pth')
+
+    # Resolve Stage 2 Checkpoint: use config path, with fallback checks
+    stage2_ckpt_path = getattr(config, 'stage2_ckpt_path', None)
+    if stage2_ckpt_path is None or not os.path.exists(stage2_ckpt_path):
+        local_s2 = os.path.join(config.checkpoint_dir, 'stage2_best.pth')
+        drive_s2 = '/content/drive/MyDrive/DPAFusion_Checkpoints/Stage2/stage2_best.pth'
+        stage2_ckpt_path = local_s2 if os.path.exists(local_s2) else drive_s2
+
     if not os.path.exists(stage2_ckpt_path):
-        stage2_ckpt_path = os.path.join(config.checkpoint_dir, 'stage2_best.pth')
+        raise FileNotFoundError(f"Stage 2 checkpoint not found at: {stage2_ckpt_path}")
+
     ckpt2 = torch.load(stage2_ckpt_path, map_location=device)
     stage2.load_state_dict(ckpt2['agent_state_dict'])
     stage2.eval()
     for p in stage2.parameters():
         p.requires_grad = False
+    print(f"-> Successfully loaded frozen Stage 2 weights from: {stage2_ckpt_path}")
 
     # 4. Initialize Stage 3 Execution Layer
     stage3 = AdaptiveSpatialFusionStage3(in_channels=128, num_operators=4).to(device)
