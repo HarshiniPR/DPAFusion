@@ -1,2 +1,15 @@
-from .film_generator import FiLMGeneratorStage4
-from .discriminator import DualDiscriminator
+from .dclar_net import (
+    DCLARNetGenerator,
+    DCLARDualDiscriminator,
+    LightweightPatchDiscriminator,
+    DepthwiseSeparableConv,
+    FiLMBlock
+)
+
+__all__ = [
+    'DCLARNetGenerator',
+    'DCLARDualDiscriminator',
+    'LightweightPatchDiscriminator',
+    'DepthwiseSeparableConv',
+    'FiLMBlock'
+]
