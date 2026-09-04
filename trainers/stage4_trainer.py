@@ -70,22 +70,22 @@ def run_stage4_training(config):
                 Fu, Fr, Ft, Sc = stage1(Ir, It)
                 actions, _, _, _ = stage2.get_action(Fu, Sc, Ir, It, deterministic=True)
                 F_fused, W_rgb, W_th = stage3(Fr, Ft, Fu, Sc, actions)
-
-            # -----------------------------------------------
-            # (1) Update Dual Discriminators (Phase II Only)
-            # -----------------------------------------------
+            
+            # (1) Update Dual Discriminators (Phase II Only, every 2-3 generator steps)
             loss_D_val = 0.0
-            if not is_warmup:
+            if not is_warmup and (step % 2 == 0):
                 opt_D.zero_grad()
                 with torch.no_grad():
                     I_fused_det = net_G(F_fused, actions).detach()
 
-                d_real_th = net_D.forward_th(It)
-                d_fake_th = net_D.forward_th(I_fused_det)
+                # Optional: Add slight noise to stabilize discriminator
+                noise = 0.02 * torch.randn_like(It)
+                d_real_th = net_D.forward_th(It + noise)
+                d_fake_th = net_D.forward_th(I_fused_det + noise)
                 loss_D_th = loss_suite.discriminator_hinge_loss(d_real_th, d_fake_th)
 
-                d_real_vis = net_D.forward_vis(I_vis_gray)
-                d_fake_vis = net_D.forward_vis(I_fused_det)
+                d_real_vis = net_D.forward_vis(I_vis_gray + noise)
+                d_fake_vis = net_D.forward_vis(I_fused_det + noise)
                 loss_D_vis = loss_suite.discriminator_hinge_loss(d_real_vis, d_fake_vis)
 
                 loss_D = loss_D_th + loss_D_vis

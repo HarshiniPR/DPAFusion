@@ -59,16 +59,19 @@ class DCLARLossSuite(nn.Module):
         x_min = x_flat.min(dim=-1, keepdim=True)[0].view(b, 1, 1, 1)
         x_max = x_flat.max(dim=-1, keepdim=True)[0].view(b, 1, 1, 1)
         return (x - x_min) / (x_max - x_min + 1e-6)
-
-    # 4.8 Hinge Discriminator Loss
+    # Bounded / Soft Hinge Discriminator Loss with margin protection
     def discriminator_hinge_loss(self, d_real, d_fake):
-        loss_real = torch.mean(F.relu(1.0 - d_real))
-        loss_fake = torch.mean(F.relu(1.0 + d_fake))
-        return loss_real + loss_fake
-
+        # Softplus formulation prevents zero-gradient death
+        loss_real = torch.mean(F.softplus(1.0 - d_real))
+        loss_fake = torch.mean(F.softplus(1.0 + d_fake))
+        return 0.5 * (loss_real + loss_fake)
+    
     # 4.8 Hinge Generator Adversarial Loss
     def generator_adv_loss(self, d_fake_th, d_fake_vis):
-        return -torch.mean(d_fake_th) - torch.mean(d_fake_vis)
+        # Generator maximizes probability of being classified real
+        loss_g_th = torch.mean(F.softplus(-d_fake_th))
+        loss_g_vis = torch.mean(F.softplus(-d_fake_vis))
+        return loss_g_th + loss_g_vis
 
     def compute_generator_losses(self, I_fused, I_vis_gray, I_th, W_th, S_c, d_fake_th=None, d_fake_vis=None, warmup=False):
         # 4.9 Thermal Saliency Preservation Loss
