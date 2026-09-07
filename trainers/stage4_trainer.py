@@ -25,7 +25,6 @@ def run_stage4_training(config):
     stage1.load_state_dict(ckpt1['model_state_dict'])
     stage1.eval()
     for p in stage1.parameters(): p.requires_grad = False
-    print(f"-> Frozen Stage 1 loaded: {config.stage1_ckpt_path}")
 
     # 3. Frozen Stage 2 PPO Policy
     stage2 = FullActorCritic(state_dim=322, hidden_dim=128).to(device)
@@ -33,7 +32,6 @@ def run_stage4_training(config):
     stage2.load_state_dict(ckpt2['agent_state_dict'])
     stage2.eval()
     for p in stage2.parameters(): p.requires_grad = False
-    print(f"-> Frozen Stage 2 loaded: {config.stage2_ckpt_path}")
 
     # 4. Frozen Stage 3 Deterministic Execution Layer
     stage3 = AdaptiveSpatialFusionStage3(in_channels=config.in_channels, num_operators=4).to(device)
@@ -43,55 +41,56 @@ def run_stage4_training(config):
     net_G = DCLARNetGenerator(in_channels=config.in_channels, cond_dim=config.cond_dim).to(device)
     net_D = DCLARDualDiscriminator().to(device)
 
-    # 6. Optimizers & Losses
+    # 6. Optimizers (TTUR: Discriminator trained with slower LR 2e-5)
     opt_G = torch.optim.Adam(net_G.parameters(), lr=config.lr_g, betas=(0.5, 0.999))
-    opt_D = torch.optim.Adam(net_D.parameters(), lr=config.lr_d, betas=(0.5, 0.999))
-    loss_suite = DCLARLossSuite().to(device)
+    opt_D = torch.optim.Adam(net_D.parameters(), lr=2e-5, betas=(0.5, 0.999))
+    loss_suite = DCLARLossSuite(lambda_adv=0.01).to(device)
 
     best_loss = float('inf')
 
     for epoch in range(1, config.epochs + 1):
         net_G.train()
         net_D.train()
-        is_warmup = (epoch <= 3) # Phase 1: Warmup for Epochs 1-3
+        is_warmup = (epoch <= config.warmup_epochs)
         
         running_loss = 0.0
-        print(f"--- Epoch [{epoch}/{config.epochs}] {'[PHASE I: CONTENT WARMUP]' if is_warmup else '[PHASE II: JOINT HINGE GAN]'} ---")
+        latest_loss_D = 0.50  # Persistent variable across steps
+
+        print(f"--- Epoch [{epoch}/{config.epochs}] {'[PHASE I: CONTENT WARMUP]' if is_warmup else '[PHASE II: JOINT LSGAN]'} ---")
 
         for step, batch in enumerate(train_loader):
             Ir = batch['rgb'].to(device)
             It = batch['ir'].to(device)
-            
-            # Grayscale luminance for visible edge calculations
             I_vis_gray = 0.2989 * Ir[:, 0:1] + 0.5870 * Ir[:, 1:2] + 0.1140 * Ir[:, 2:3]
 
-            # Frozen Inference: Stages I -> II -> III
+            # Frozen Inference: Stages 1 -> 2 -> 3
             with torch.no_grad():
                 Fu, Fr, Ft, Sc = stage1(Ir, It)
                 actions, _, _, _ = stage2.get_action(Fu, Sc, Ir, It, deterministic=True)
                 F_fused, W_rgb, W_th = stage3(Fr, Ft, Fu, Sc, actions)
-            
-            # (1) Update Dual Discriminators (Phase II Only, every 2-3 generator steps)
-            loss_D_val = 0.0
-            if not is_warmup and (step % 2 == 0):
+
+            # -----------------------------------------------
+            # (1) Update Dual Discriminators (Phase II)
+            # -----------------------------------------------
+            if not is_warmup:
                 opt_D.zero_grad()
                 with torch.no_grad():
                     I_fused_det = net_G(F_fused, actions).detach()
 
-                # Optional: Add slight noise to stabilize discriminator
-                noise = 0.02 * torch.randn_like(It)
-                d_real_th = net_D.forward_th(It + noise)
-                d_fake_th = net_D.forward_th(I_fused_det + noise)
-                loss_D_th = loss_suite.discriminator_hinge_loss(d_real_th, d_fake_th)
+                d_real_th = net_D.forward_th(It)
+                d_fake_th = net_D.forward_th(I_fused_det)
+                loss_D_th = loss_suite.discriminator_lsgan_loss(d_real_th, d_fake_th)
 
-                d_real_vis = net_D.forward_vis(I_vis_gray + noise)
-                d_fake_vis = net_D.forward_vis(I_fused_det + noise)
-                loss_D_vis = loss_suite.discriminator_hinge_loss(d_real_vis, d_fake_vis)
+                d_real_vis = net_D.forward_vis(I_vis_gray)
+                d_fake_vis = net_D.forward_vis(I_fused_det)
+                loss_D_vis = loss_suite.discriminator_lsgan_loss(d_real_vis, d_fake_vis)
 
                 loss_D = loss_D_th + loss_D_vis
                 loss_D.backward()
+                # Gradient clipping on discriminator to prevent explosion
+                torch.nn.utils.clip_grad_norm_(net_D.parameters(), max_norm=1.0)
                 opt_D.step()
-                loss_D_val = loss_D.item()
+                latest_loss_D = loss_D.item()
 
             # -----------------------------------------------
             # (2) Update DCLAR-Net Generator
@@ -124,13 +123,13 @@ def run_stage4_training(config):
                     f"SSIM: {loss_dict['L_ssim']:.4f} | "
                     f"Red: {loss_dict['L_red']:.4f} | "
                     f"Adv: {loss_dict['L_adv']:.4f} | "
-                    f"Loss_D: {loss_D_val:.4f}"
+                    f"Loss_D: {latest_loss_D:.4f}"
                 )
 
         avg_loss = running_loss / len(train_loader)
         print(f"\nEPOCH {epoch} SUMMARY | Avg Generator Loss: {avg_loss:.4f}\n")
 
-        # Save local epoch checkpoint
+        # Save Checkpoints
         ckpt_path = os.path.join(config.checkpoint_dir, f'stage4_epoch_{epoch}.pth')
         torch.save({
             'epoch': epoch,

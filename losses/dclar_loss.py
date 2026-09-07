@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class SSIMLoss(nn.Module):
-    """ Differentiable SSIM calculation """
     def __init__(self, window_size=11):
         super().__init__()
         self.window_size = window_size
@@ -35,10 +34,6 @@ class SSIMLoss(nn.Module):
 
 
 class DCLARLossSuite(nn.Module):
-    """
-    Consolidated 5-Term Stage IV Loss Suite
-    L_G = lambda_adv * L_adv + lambda_th * L_th_sal + lambda_vis * L_grad + lambda_str * L_ssim + lambda_red * L_red
-    """
     def __init__(self, lambda_adv=0.01, lambda_th=1.0, lambda_vis=1.0, lambda_str=1.0, lambda_red=0.2):
         super().__init__()
         self.lambda_adv = lambda_adv
@@ -47,6 +42,7 @@ class DCLARLossSuite(nn.Module):
         self.lambda_str = lambda_str
         self.lambda_red = lambda_red
         self.ssim_loss = SSIMLoss()
+        self.mse = nn.MSELoss()
 
     def gradient(self, img):
         gx = torch.abs(img[:, :, :, :-1] - img[:, :, :, 1:])
@@ -59,51 +55,51 @@ class DCLARLossSuite(nn.Module):
         x_min = x_flat.min(dim=-1, keepdim=True)[0].view(b, 1, 1, 1)
         x_max = x_flat.max(dim=-1, keepdim=True)[0].view(b, 1, 1, 1)
         return (x - x_min) / (x_max - x_min + 1e-6)
-    # Bounded / Soft Hinge Discriminator Loss with margin protection
-    def discriminator_hinge_loss(self, d_real, d_fake):
-        # Softplus formulation prevents zero-gradient death
-        loss_real = torch.mean(F.softplus(1.0 - d_real))
-        loss_fake = torch.mean(F.softplus(1.0 + d_fake))
+
+    # LSGAN (Least Squares GAN) Objective - Stable, bounded, non-saturating
+    def discriminator_lsgan_loss(self, d_real, d_fake):
+        real_target = torch.ones_like(d_real)
+        fake_target = torch.zeros_like(d_fake)
+        loss_real = self.mse(d_real, real_target)
+        loss_fake = self.mse(d_fake, fake_target)
         return 0.5 * (loss_real + loss_fake)
-    
-    # 4.8 Hinge Generator Adversarial Loss
-    def generator_adv_loss(self, d_fake_th, d_fake_vis):
-        # Generator maximizes probability of being classified real
-        loss_g_th = torch.mean(F.softplus(-d_fake_th))
-        loss_g_vis = torch.mean(F.softplus(-d_fake_vis))
+
+    def generator_lsgan_loss(self, d_fake_th, d_fake_vis):
+        target = torch.ones_like(d_fake_th)
+        loss_g_th = self.mse(d_fake_th, target)
+        loss_g_vis = self.mse(d_fake_vis, target)
         return loss_g_th + loss_g_vis
 
     def compute_generator_losses(self, I_fused, I_vis_gray, I_th, W_th, S_c, d_fake_th=None, d_fake_vis=None, warmup=False):
-        # 4.9 Thermal Saliency Preservation Loss
+        # 1. Thermal Saliency Loss
         G_th = self.gradient(I_th)
         S_th = self.normalize(I_th + 0.5 * G_th)
         L_th_sal = torch.mean(S_th * torch.abs(I_fused - I_th))
 
-        # 4.10 Visible Detail Preservation Loss
+        # 2. Visible Detail Loss
         G_vis = self.gradient(I_vis_gray)
         G_fused = self.gradient(I_fused)
         S_vis = self.normalize(G_vis)
         L_grad = torch.mean(S_vis * torch.abs(G_fused - G_vis))
 
-        # 4.11 Structural Preservation Loss (Decision-Consistent Reference)
+        # 3. Structural Loss
         W_th_up = F.interpolate(W_th, size=I_fused.shape[2:], mode='bilinear', align_corners=False)
         W_vis_up = 1.0 - W_th_up
         I_ref = (W_th_up * I_th) + (W_vis_up * I_vis_gray)
         L_ssim = self.ssim_loss(I_fused, I_ref)
 
-        # 4.12 Redundancy Suppression Loss
-        # S_c is (B, 128) -> reduce across channels to get spatial map
-        S_c_mean = S_c.mean(dim=1, keepdim=True).unsqueeze(-1).unsqueeze(-1) # (B, 1, 1, 1)
+        # 4. Redundancy Suppression
+        S_c_mean = S_c.mean(dim=1, keepdim=True).unsqueeze(-1).unsqueeze(-1)
         R_c = 1.0 - S_c_mean
         L_red = torch.mean(R_c * torch.abs(I_fused - I_ref))
 
-        # Warmup handles content objectives prior to adversarial training
+        # 5. Adversarial Loss (LSGAN)
         if warmup or d_fake_th is None or d_fake_vis is None:
             L_adv = torch.tensor(0.0, device=I_fused.device)
             total_loss = (self.lambda_th * L_th_sal) + (self.lambda_vis * L_grad) + \
                          (self.lambda_str * L_ssim) + (self.lambda_red * L_red)
         else:
-            L_adv = self.generator_adv_loss(d_fake_th, d_fake_vis)
+            L_adv = self.generator_lsgan_loss(d_fake_th, d_fake_vis)
             total_loss = (self.lambda_adv * L_adv) + (self.lambda_th * L_th_sal) + \
                          (self.lambda_vis * L_grad) + (self.lambda_str * L_ssim) + \
                          (self.lambda_red * L_red)
