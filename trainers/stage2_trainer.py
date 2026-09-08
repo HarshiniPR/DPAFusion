@@ -7,7 +7,7 @@ from datasets.dataset import LLVIPDataset
 from models.feature_representation.stage1_net import Stage1LHMRM
 from models.rl_policy.ppo_actor_critic import FullActorCritic
 from models.adaptive_fusion.stage3_fusion import AdaptiveSpatialFusionStage3
-from losses.ppo_reward import AdaptiveFusionReward
+from losses.stage2_reward import AdaptiveFusionReward
 
 def train_stage2_ppo(config):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
