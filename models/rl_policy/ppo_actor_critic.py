@@ -17,10 +17,10 @@ class FullActorCritic(nn.Module):
             nn.LeakyReLU(0.2, inplace=True)
         )
         
-        # 2. Discrete Head (Operator Selection: 4 Primitives)
+        # 2. Discrete Head: 4 Fusion Operator Primitives
         self.actor_op = nn.Linear(hidden_dim, num_ops)
         
-        # 3. Continuous Head: 3 parameters -> [c_rgb, r_lvl, d_pres]
+        # 3. Continuous Head: 3 latent variables -> [c_rgb, r_lvl, d_pres]
         self.actor_cont_mean = nn.Linear(hidden_dim, 3)
         self.actor_cont_log_std = nn.Parameter(torch.ones(1, 3) * -0.30)
         
@@ -61,7 +61,7 @@ class FullActorCritic(nn.Module):
         else:
             sc_flat = Sc.flatten(start_dim=1)
             
-        # C. Low-level Environmental Context
+        # C. Global Scene Context
         vis_gray = 0.2989 * Ir[:, 0:1] + 0.5870 * Ir[:, 1:2] + 0.1140 * Ir[:, 2:3]
         stats = torch.cat([
             vis_gray.mean(dim=[1, 2, 3], keepdim=True).view(b, 1),
@@ -70,7 +70,7 @@ class FullActorCritic(nn.Module):
             It.std(dim=[1, 2, 3], keepdim=True).view(b, 1)
         ], dim=-1)  # (B, 4)
         
-        # Total state: 128 + 128 + 62 + 4 = 322 dims
+        # Total state vector: 128 + 128 + 62 + 4 = 322 dims
         state = torch.cat([fu_flat, sc_flat, fu_max[:, :62], stats], dim=-1)
         return state
 
@@ -78,11 +78,11 @@ class FullActorCritic(nn.Module):
         state = self.extract_state(Fu, Sc, Ir, It)
         features = self.actor_trunk(state)
         
-        # Discrete branch
+        # Discrete Branch
         op_logits = self.actor_op(features)
         dist_op = Categorical(logits=op_logits)
         
-        # Continuous branch (dim=3)
+        # Continuous Branch (3 params)
         cont_mean = torch.tanh(self.actor_cont_mean(features))
         cont_std = torch.exp(self.actor_cont_log_std).expand_as(cont_mean)
         dist_cont = Normal(cont_mean, cont_std)
@@ -96,9 +96,10 @@ class FullActorCritic(nn.Module):
             
         cont_action = torch.clamp(cont_action, -0.99, 0.99)
         
-        # Map actions
+        # Parameter Unpacking & Normalization
         alpha_op = F.one_hot(op_idx, num_classes=4).float()
         c_rgb = (cont_action[:, 0:1] + 1.0) / 2.0   # Scale [-1, 1] -> [0, 1]
+        c_th = 1.0 - c_rgb                          # Complementary balance
         r_lvl = (cont_action[:, 1:2] + 1.0) / 2.0   # Scale [-1, 1] -> [0, 1]
         d_pres = cont_action[:, 2:3]                # Bounded in [-1, 1]
         
@@ -106,10 +107,12 @@ class FullActorCritic(nn.Module):
         log_prob_cont = dist_cont.log_prob(cont_action).sum(dim=-1)
         total_log_prob = log_prob_op + log_prob_cont
         
+        # Complete dictionary containing all keys for Stage 3, Stage 4, and Trainers
         actions = {
             'alpha_op': alpha_op,
             'op_idx': op_idx,
             'c_rgb': c_rgb,
+            'c_th': c_th,
             'r_lvl': r_lvl,
             'd_pres': d_pres,
             'cont_action': cont_action
@@ -120,11 +123,11 @@ class FullActorCritic(nn.Module):
     def evaluate_actions(self, states, op_indices, cont_actions):
         features = self.actor_trunk(states)
         
-        # Discrete
+        # Discrete Evaluation
         op_logits = self.actor_op(features)
         dist_op = Categorical(logits=op_logits)
         
-        # Continuous
+        # Continuous Evaluation
         cont_mean = torch.tanh(self.actor_cont_mean(features))
         cont_std = torch.exp(self.actor_cont_log_std).expand_as(cont_mean)
         dist_cont = Normal(cont_mean, cont_std)
