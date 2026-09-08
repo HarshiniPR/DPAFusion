@@ -7,8 +7,8 @@ class FullActorCritic(nn.Module):
     def __init__(self, state_dim=322, hidden_dim=128, num_ops=4):
         super().__init__()
         
-        # Shared / Actor feature representation
-        self.shared_net = nn.Sequential(
+        # 1. Feature Representation Trunk
+        self.actor_trunk = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.LeakyReLU(0.2, inplace=True),
@@ -17,17 +17,20 @@ class FullActorCritic(nn.Module):
             nn.LeakyReLU(0.2, inplace=True)
         )
         
-        # 1. Discrete Head: Fusion Operator Alpha (4 primitives)
+        # 2. Discrete Head (Operator Selection: 4 Primitives)
         self.actor_op = nn.Linear(hidden_dim, num_ops)
         
-        # 2. Continuous Head: r_lvl (Reconstruction Level) & d_pres (Detail Preservation)
+        # 3. Continuous Head (r_lvl, d_pres)
         self.actor_cont_mean = nn.Linear(hidden_dim, 2)
-        # Trainable log_std initialized higher to encourage exploration
-        self.actor_cont_log_std = nn.Parameter(torch.ones(1, 2) * -0.5)  # std ~ 0.60
+        # Initialize log_std to -0.30 (~0.74 std) to force exploration in early epochs
+        self.actor_cont_log_std = nn.Parameter(torch.ones(1, 2) * -0.30)
         
-        # 3. Critic Value Head
-        self.critic = nn.Sequential(
+        # 4. Critic Trunk & Value Head
+        self.critic_trunk = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Linear(hidden_dim, 1)
@@ -41,59 +44,67 @@ class FullActorCritic(nn.Module):
                 nn.init.orthogonal_(m.weight, gain=1.0)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
-        # Small gain on policy heads prevents extreme early logits
+        # Small weights on decision heads to start near uniform exploration
         nn.init.orthogonal_(self.actor_op.weight, gain=0.01)
         nn.init.orthogonal_(self.actor_cont_mean.weight, gain=0.01)
 
     def extract_state(self, Fu, Sc, Ir, It):
-        # Flatten and concatenate multi-modal features and global descriptors
         b = Fu.size(0)
-        fu_flat = F.adaptive_avg_pool2d(Fu, (1, 1)).view(b, -1)     # (B, 128)
-        sc_flat = F.adaptive_avg_pool2d(Sc, (1, 1)).view(b, -1)     # (B, 128)
         
-        # Global illuminance, thermal contrast, and gradient stats
+        # A. Fu representation (4D: [B, C, H, W])
+        fu_flat = F.adaptive_avg_pool2d(Fu, (1, 1)).view(b, -1)     # (B, 128)
+        fu_max = F.adaptive_max_pool2d(Fu, (1, 1)).view(b, -1)      # (B, 128)
+        
+        # B. Sc representation (Robust to 2D [B, 128] or 4D [B, 128, 1, 1])
+        if Sc.dim() == 4:
+            sc_flat = F.adaptive_avg_pool2d(Sc, (1, 1)).view(b, -1)
+        elif Sc.dim() == 2:
+            sc_flat = Sc.view(b, -1)
+        else:
+            sc_flat = Sc.flatten(start_dim=1)
+            
+        # C. Low-level Environmental Context
         vis_gray = 0.2989 * Ir[:, 0:1] + 0.5870 * Ir[:, 1:2] + 0.1140 * Ir[:, 2:3]
         stats = torch.cat([
             vis_gray.mean(dim=[1, 2, 3], keepdim=True).view(b, 1),
             vis_gray.std(dim=[1, 2, 3], keepdim=True).view(b, 1),
             It.mean(dim=[1, 2, 3], keepdim=True).view(b, 1),
-            It.std(dim=[1, 2, 3], keepdim=True).view(b, 1),
+            It.std(dim=[1, 2, 3], keepdim=True).view(b, 1)
         ], dim=-1) # (B, 4)
         
-        # Additional channel-wise statistics to match state_dim=322
-        fu_max = F.adaptive_max_pool2d(Fu, (1, 1)).view(b, -1)
+        # Concatenation: 128 + 128 + 62 + 4 = 322 dims
         state = torch.cat([fu_flat, sc_flat, fu_max[:, :62], stats], dim=-1)
         return state
 
     def get_action(self, Fu, Sc, Ir, It, deterministic=False):
         state = self.extract_state(Fu, Sc, Ir, It)
-        features = self.shared_net(state)
+        features = self.actor_trunk(state)
         
-        # Discrete Operator Distribution
+        # Discrete branch
         op_logits = self.actor_op(features)
-        op_dist = Categorical(logits=op_logits)
+        dist_op = Categorical(logits=op_logits)
         
-        # Continuous (r_lvl, d_pres) Distribution
+        # Continuous branch
         cont_mean = torch.tanh(self.actor_cont_mean(features))
         cont_std = torch.exp(self.actor_cont_log_std).expand_as(cont_mean)
-        cont_dist = Normal(cont_mean, cont_std)
+        dist_cont = Normal(cont_mean, cont_std)
         
         if deterministic:
             op_idx = torch.argmax(op_logits, dim=-1)
             cont_action = cont_mean
         else:
-            op_idx = op_dist.sample()
-            cont_action = cont_dist.sample()
+            op_idx = dist_op.sample()
+            cont_action = dist_cont.sample()
             
         cont_action = torch.clamp(cont_action, -0.99, 0.99)
         
-        # Map actions to dictionary
+        # Action dictionary formation
         alpha_op = F.one_hot(op_idx, num_classes=4).float()
-        r_lvl = (cont_action[:, 0:1] + 1.0) / 2.0  # scale to [0, 1]
-        d_pres = cont_action[:, 1:2]               # scale in [-1, 1]
+        r_lvl = (cont_action[:, 0:1] + 1.0) / 2.0   # Scale from [-1, 1] to [0, 1]
+        d_pres = cont_action[:, 1:2]                # Scale in [-1, 1]
         
-        log_prob_op = op_dist.log_prob(op_idx)
-        log_prob_cont = cont_dist.log_prob(cont_action).sum(dim=-1)
+        log_prob_op = dist_op.log_prob(op_idx)
+        log_prob_cont = dist_cont.log_prob(cont_action).sum(dim=-1)
         total_log_prob = log_prob_op + log_prob_cont
         
         actions = {
@@ -103,26 +114,28 @@ class FullActorCritic(nn.Module):
             'd_pres': d_pres,
             'cont_action': cont_action
         }
-        return actions, total_log_prob, state, self.critic(state)
+        values = self.critic_trunk(state)
+        return actions, total_log_prob, state, values
 
     def evaluate_actions(self, states, op_indices, cont_actions):
-        features = self.shared_net(states)
+        features = self.actor_trunk(states)
         
+        # Discrete
         op_logits = self.actor_op(features)
-        op_dist = Categorical(logits=op_logits)
+        dist_op = Categorical(logits=op_logits)
         
+        # Continuous
         cont_mean = torch.tanh(self.actor_cont_mean(features))
         cont_std = torch.exp(self.actor_cont_log_std).expand_as(cont_mean)
-        cont_dist = Normal(cont_mean, cont_std)
+        dist_cont = Normal(cont_mean, cont_std)
         
-        log_prob_op = op_dist.log_prob(op_indices)
-        log_prob_cont = cont_dist.log_prob(cont_actions).sum(dim=-1)
+        log_prob_op = dist_op.log_prob(op_indices)
+        log_prob_cont = dist_cont.log_prob(cont_actions).sum(dim=-1)
         total_log_prob = log_prob_op + log_prob_cont
         
-        # Explicit Entropies
-        entropy_op = op_dist.entropy()
-        entropy_cont = cont_dist.entropy().sum(dim=-1)
-        total_entropy = entropy_op + entropy_cont
+        # Track both entropies separately
+        entropy_op = dist_op.entropy().mean()
+        entropy_cont = dist_cont.entropy().sum(dim=-1).mean()
         
-        values = self.critic(states)
-        return total_log_prob, values, total_entropy
+        values = self.critic_trunk(states)
+        return total_log_prob, values, entropy_op, entropy_cont
