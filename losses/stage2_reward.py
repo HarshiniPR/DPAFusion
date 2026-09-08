@@ -2,36 +2,45 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class FullMultiObjectiveReward(nn.Module):
-    def __init__(self, lambda1=1.0, lambda2=0.3, lambda3=0.2, lambda4=0.1, lambda5=0.1):
+class AdaptiveFusionReward(nn.Module):
+    def __init__(self):
         super().__init__()
-        self.l1, self.l2, self.l3, self.l4, self.l5 = lambda1, lambda2, lambda3, lambda4, lambda5
-        self.register_buffer('op_costs', torch.tensor([0.1, 0.2, 0.5, 1.0]))
 
-    def compute_image_quality(self, F_fused):
-        contrast = torch.std(F_fused, dim=[-2, -1]).mean(dim=-1)
-        return contrast
-
-    def compute_compl_util(self, W_rgb, Sc):
-        W_centered = W_rgb - 0.5
-        Sc_centered = Sc - 0.5
-        cos_sim = F.cosine_similarity(W_centered.mean(dim=[-2, -1]), Sc_centered, dim=-1)
-        return cos_sim
-
-    def compute_penalties(self, W_rgb):
-        tv_h = torch.abs(W_rgb[:, :, 1:, :] - W_rgb[:, :, :-1, :]).mean()
-        tv_w = torch.abs(W_rgb[:, :, :, 1:] - W_rgb[:, :, :, :-1]).mean()
-        tv_penalty = tv_h + tv_w
+    def forward(self, Ir, It, F_fused, W_th, actions):
+        """
+        Rewards actions that adapt dynamically to illumination and thermal presence.
+        """
+        b = Ir.size(0)
+        vis_gray = 0.2989 * Ir[:, 0:1] + 0.5870 * Ir[:, 1:2] + 0.1140 * Ir[:, 2:3]
         
-        mean_w = torch.abs(W_rgb.mean() - 0.5)
-        collapse_penalty = F.relu(mean_w - 0.3)
-        return 0.05 * tv_penalty + 0.05 * collapse_penalty
+        # 1. Thermal Salient Foreground Contrast Reward
+        # High score when W_th activates on actual heat targets
+        target_mask = (It > 0.45).float()
+        th_overlap = (W_th * target_mask).sum(dim=[1, 2, 3]) / (target_mask.sum(dim=[1, 2, 3]) + 1e-5)
+        bg_mask = (It <= 0.45).float()
+        th_leakage = (W_th * bg_mask).sum(dim=[1, 2, 3]) / (bg_mask.sum(dim=[1, 2, 3]) + 1e-5)
+        R_thermal = 2.0 * (th_overlap - 0.5 * th_leakage)
 
-    def forward(self, F_fused, W_rgb, Sc, alpha_op):
-        q_img = self.compute_image_quality(F_fused)
-        compl_util = self.compute_compl_util(W_rgb, Sc)
-        penalty = self.compute_penalties(W_rgb)
-        compute_cost = torch.sum(alpha_op * self.op_costs, dim=-1)
+        # 2. Detail and Gradient Richness (Spatial Frequency)
+        gx = torch.abs(F_fused[:, :, :, :-1] - F_fused[:, :, :, 1:]).mean(dim=[1, 2, 3])
+        gy = torch.abs(F_fused[:, :, :-1, :] - F_fused[:, :, 1:, :]).mean(dim=[1, 2, 3])
+        sf_score = torch.tanh((gx + gy) * 5.0)
+        R_detail = 1.5 * sf_score
 
-        total_reward = (self.l2 * q_img) + (self.l3 * compl_util) - (self.l4 * penalty) - (self.l5 * compute_cost)
-        return total_reward.unsqueeze(-1)
+        # 3. Illumination Context Bonus
+        mean_vis = vis_gray.mean(dim=[1, 2, 3])
+        op_idx = actions['op_idx']
+        # If dark (<0.20), reward selecting thermal-dominant operators (e.g. Op 1 or 2)
+        # If bright (>0.50), reward balanced/visible operators (Op 0 or 3)
+        R_context = torch.where(
+            mean_vis < 0.20,
+            torch.where((op_idx == 1) | (op_idx == 2), 1.0, -0.5),
+            torch.where((op_idx == 0) | (op_idx == 3), 0.8, -0.2)
+        )
+
+        # 4. Anti-saturation Penalty on d_pres
+        d_pres = actions['d_pres'].squeeze(-1)
+        P_sat = torch.relu(torch.abs(d_pres) - 0.85) * 2.0
+
+        total_reward = R_thermal + R_detail + R_context - P_sat
+        return total_reward.detach()
