@@ -20,10 +20,9 @@ class FullActorCritic(nn.Module):
         # 2. Discrete Head (Operator Selection: 4 Primitives)
         self.actor_op = nn.Linear(hidden_dim, num_ops)
         
-        # 3. Continuous Head (r_lvl, d_pres)
-        self.actor_cont_mean = nn.Linear(hidden_dim, 2)
-        # Initialize log_std to -0.30 (~0.74 std) to force exploration in early epochs
-        self.actor_cont_log_std = nn.Parameter(torch.ones(1, 2) * -0.30)
+        # 3. Continuous Head: 3 parameters -> [c_rgb, r_lvl, d_pres]
+        self.actor_cont_mean = nn.Linear(hidden_dim, 3)
+        self.actor_cont_log_std = nn.Parameter(torch.ones(1, 3) * -0.30)
         
         # 4. Critic Trunk & Value Head
         self.critic_trunk = nn.Sequential(
@@ -44,7 +43,6 @@ class FullActorCritic(nn.Module):
                 nn.init.orthogonal_(m.weight, gain=1.0)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
-        # Small weights on decision heads to start near uniform exploration
         nn.init.orthogonal_(self.actor_op.weight, gain=0.01)
         nn.init.orthogonal_(self.actor_cont_mean.weight, gain=0.01)
 
@@ -70,9 +68,9 @@ class FullActorCritic(nn.Module):
             vis_gray.std(dim=[1, 2, 3], keepdim=True).view(b, 1),
             It.mean(dim=[1, 2, 3], keepdim=True).view(b, 1),
             It.std(dim=[1, 2, 3], keepdim=True).view(b, 1)
-        ], dim=-1) # (B, 4)
+        ], dim=-1)  # (B, 4)
         
-        # Concatenation: 128 + 128 + 62 + 4 = 322 dims
+        # Total state: 128 + 128 + 62 + 4 = 322 dims
         state = torch.cat([fu_flat, sc_flat, fu_max[:, :62], stats], dim=-1)
         return state
 
@@ -84,7 +82,7 @@ class FullActorCritic(nn.Module):
         op_logits = self.actor_op(features)
         dist_op = Categorical(logits=op_logits)
         
-        # Continuous branch
+        # Continuous branch (dim=3)
         cont_mean = torch.tanh(self.actor_cont_mean(features))
         cont_std = torch.exp(self.actor_cont_log_std).expand_as(cont_mean)
         dist_cont = Normal(cont_mean, cont_std)
@@ -98,10 +96,11 @@ class FullActorCritic(nn.Module):
             
         cont_action = torch.clamp(cont_action, -0.99, 0.99)
         
-        # Action dictionary formation
+        # Map actions
         alpha_op = F.one_hot(op_idx, num_classes=4).float()
-        r_lvl = (cont_action[:, 0:1] + 1.0) / 2.0   # Scale from [-1, 1] to [0, 1]
-        d_pres = cont_action[:, 1:2]                # Scale in [-1, 1]
+        c_rgb = (cont_action[:, 0:1] + 1.0) / 2.0   # Scale [-1, 1] -> [0, 1]
+        r_lvl = (cont_action[:, 1:2] + 1.0) / 2.0   # Scale [-1, 1] -> [0, 1]
+        d_pres = cont_action[:, 2:3]                # Bounded in [-1, 1]
         
         log_prob_op = dist_op.log_prob(op_idx)
         log_prob_cont = dist_cont.log_prob(cont_action).sum(dim=-1)
@@ -110,6 +109,7 @@ class FullActorCritic(nn.Module):
         actions = {
             'alpha_op': alpha_op,
             'op_idx': op_idx,
+            'c_rgb': c_rgb,
             'r_lvl': r_lvl,
             'd_pres': d_pres,
             'cont_action': cont_action
@@ -133,7 +133,6 @@ class FullActorCritic(nn.Module):
         log_prob_cont = dist_cont.log_prob(cont_actions).sum(dim=-1)
         total_log_prob = log_prob_op + log_prob_cont
         
-        # Track both entropies separately
         entropy_op = dist_op.entropy().mean()
         entropy_cont = dist_cont.entropy().sum(dim=-1).mean()
         
