@@ -9,7 +9,7 @@ from models.rl_policy.ppo_actor_critic import FullActorCritic
 from models.adaptive_fusion.stage3_fusion import AdaptiveSpatialFusionStage3
 from losses.stage2_reward import AdaptiveFusionReward
 
-def train_stage2_ppo(config):
+def run_stage2_training(config):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     print(f"=== Training Stage II: PPO Policy on {device} ===")
